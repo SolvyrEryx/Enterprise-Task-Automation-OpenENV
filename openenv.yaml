@@ -1,0 +1,206 @@
+---
+# OpenEnv Specification for Enterprise Task Automation Environment
+# Compatible with Meta AI Hackathon requirements
+
+name: enterprise-task-automation
+version: "1.0.0"
+description: >
+  OpenEnv-compatible RL environment for optimizing enterprise workflow management.
+  Simulates realistic scenarios with email triage, meeting scheduling, and task prioritization.
+
+entry_point: "src.environment:EnterpriseEnv"
+
+environment:
+  max_episode_steps: 100
+  reward_range: [-1.0, 1.0]
+  
+api:
+  reset:
+    description: "Reset environment to initial state"
+    endpoint: "/reset"
+    parameters:
+      seed:
+        type: integer
+        optional: true
+        description: "Random seed for reproducibility"
+    returns:
+      observation: Observation
+      info: object
+
+  step:
+    description: "Execute one action step in the environment"
+    endpoint: "/step"
+    parameters:
+      action: Action
+    returns:
+      observation: Observation
+      reward: number
+      terminated: boolean
+      truncated: boolean
+      info: object
+
+  state:
+    description: "Get current environment state without executing action"
+    endpoint: "/state"
+    returns:
+      observation: Observation
+
+action_spec:
+  type: "Action"
+  action_types:
+    - TRIAGE_EMAIL
+    - SCHEDULE_MEETING
+    - RESCHEDULE_MEETING
+    - CREATE_TASK
+    - REPRIORITIZE_TASK
+    - SEND_NOTIFICATION
+    - ESCALATE
+    - COMPLETE_TASK
+    - NOOP
+
+observation_spec:
+  type: "Observation"
+  fields:
+    step: integer
+    timestamp: datetime
+    emails: array[Email]
+    meetings: array[Meeting]
+    tasks: array[Task]
+    notifications: array[Notification]
+    done: boolean
+    truncated: boolean
+    valid_actions: array[string]
+    # Derived metrics (30+)
+    unprocessed_emails_count: integer
+    urgent_emails_count: integer
+    email_triage_rate: number
+    scheduled_meetings_count: integer
+    meeting_conflicts: integer
+    meeting_schedule_success_rate: number
+    overdue_tasks_count: integer
+    blocked_tasks_count: integer
+    task_completion_rate: number
+    unread_notifications_count: integer
+    time_until_end: integer
+
+reward_spec:
+  type: "Reward"
+  range: [0.0, 1.0]
+  components:
+    - email_processing_reward
+    - meeting_scheduling_reward
+    - task_prioritization_reward
+    - deadline_adherence_reward
+    - efficiency_reward
+    - escalation_penalty
+
+tasks:
+  - name: "Email Triage Efficiency"
+    difficulty: easy
+    description: "Triage at least 80% of emails, correctly prioritizing urgent ones"
+    scoring: "0.5 (triage rate) + 0.5 (priority accuracy)"
+    
+  - name: "Meeting Scheduling & Task Prioritization"
+    difficulty: medium
+    description: "Schedule 70% of meetings without conflicts, reprioritize 60% of tasks"
+    scoring: "0.4 (meetings) + 0.3 (conflicts) + 0.3 (prioritization)"
+    
+  - name: "Comprehensive Workflow Optimization"
+    difficulty: hard
+    description: "Maximize all workflow dimensions simultaneously"
+    scoring: "0.25 (emails) + 0.25 (meetings) + 0.25 (tasks) + 0.25 (system health)"
+
+types:
+  Email:
+    fields:
+      email_id: string
+      sender: string
+      subject: string
+      body: string
+      timestamp: datetime
+      urgency: integer[0-10]
+      category: EmailCategory
+      priority: EmailPriority
+      processed: boolean
+      
+  Meeting:
+    fields:
+      meeting_id: string
+      title: string
+      participants: array[string]
+      priority: integer[0-10]
+      duration_minutes: integer
+      scheduled_time: datetime
+      business_impact: number[0-1]
+      status: string
+      
+  Task:
+    fields:
+      task_id: string
+      title: string
+      deadline: datetime
+      priority: TaskPriority
+      urgency: integer[0-10]
+      impact: number[0-1]
+      status: TaskStatus
+      estimated_hours: number
+      
+  Action:
+    fields:
+      action_type: ActionType
+      email_id: string (optional)
+      category: EmailCategory (optional)
+      priority: EmailPriority (optional)
+      meeting_id: string (optional)
+      scheduled_time: datetime (optional)
+      task_id: string (optional)
+      new_priority: TaskPriority (optional)
+      
+  Observation:
+    fields:
+      step: integer
+      timestamp: datetime
+      emails: array[Email]
+      meetings: array[Meeting]
+      tasks: array[Task]
+      notifications: array[Notification]
+      done: boolean
+
+enumerations:
+  EmailCategory:
+    - URGENT
+    - ACTIONABLE
+    - INFORMATIONAL
+    - SPAM
+    
+  EmailPriority:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+    - LOW
+    
+  TaskStatus:
+    - PENDING
+    - IN_PROGRESS
+    - COMPLETED
+    - BLOCKED
+    
+  TaskPriority:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+    - LOW
+
+compliance:
+  openenv_version: "1.0"
+  gymnasium_compatible: true
+  python_version_min: "3.10"
+  required_packages:
+    - pydantic>=2.0
+    - gymnasium>=0.29.0
+    - numpy>=1.24.0
+
+deployment:
+  docker_supported: true
+  hf_spaces_compatible: true
+  rest_api_available: true
