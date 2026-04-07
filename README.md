@@ -1,19 +1,4 @@
----
-title: Enterprise Task Automation
-emoji: chart_with_upwards_trend
-colorFrom: blue
-colorTo: green
-sdk: docker
-sdk_version: latest
-app_file: app.py
-pinned: false
-tags:
-  - openenv
-  - enterprise
-  - workflow
-  - reinforcement-learning
-  - openai-gym
----
+
 
 # Enterprise Task Automation Environment
 
