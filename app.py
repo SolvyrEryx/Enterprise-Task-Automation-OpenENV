@@ -1,11 +1,21 @@
 """
-Gradio interface for Hugging Face Spaces deployment
+FastAPI + Gradio interface for Hugging Face Spaces deployment
 Enterprise Task Automation — OpenEnv Hackathon
 """
+import sys
+from pathlib import Path
+# This ensures it can still find the 'src' folder from inside the 'server' folder
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
-import gradio as gr
 from datetime import timedelta
+import os
+from datetime import timedelta
+import uvicorn
+import gradio as gr
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 
 from inference import run_llm_agent, STEP_BUDGETS
 from src import (
@@ -18,13 +28,72 @@ from src import (
 )
 from src.graders import evaluate_agent_performance
 
-# ── Global environment instance (single user demo) ───────────────────────────
+
+# ── FastAPI App ─────────────────────────────────────────────────────────────
+# This is the REST API layer that the OpenEnv Evaluator will talk to.
+app = FastAPI(title="Enterprise Task Automation — OpenEnv API")
+
+# ── Global environment instance (Shared for API & UI) ───────────────────────
 _env_instance: dict = {"env": None, "obs": None}
+
+
+# ── API Pydantic Request Models ──────────────────────────────────────────────
+class ResetRequest(BaseModel):
+    seed: Optional[int] = 42
+    num_emails_per_day: int = 10
+    num_meetings_per_day: int = 5
+    num_tasks_per_day: int = 8
+    max_steps: int = 100
+
+class StepRequest(BaseModel):
+    action: Action
+
+
+# ── 1. API Endpoints (Crucial for the Evaluator) ─────────────────────────────
+@app.post("/reset")
+def api_reset(req: ResetRequest = ResetRequest()):
+    """Evaluator calls this to start a new episode."""
+    env = EnterpriseEnv(
+        num_emails_per_day=req.num_emails_per_day,
+        num_meetings_per_day=req.num_meetings_per_day,
+        num_tasks_per_day=req.num_tasks_per_day,
+        max_steps=req.max_steps,
+    )
+    obs, info = env.reset(seed=req.seed)
+    _env_instance["env"] = env
+    _env_instance["obs"] = obs
+    
+    return {"observation": obs, "info": info}
+
+@app.post("/step")
+def api_step(req: StepRequest):
+    """Evaluator calls this to take an action."""
+    env = _env_instance.get("env")
+    if not env:
+        api_reset(ResetRequest())
+        env = _env_instance["env"]
+
+    obs, reward, terminated, truncated, info = env.step(req.action)
+    _env_instance["obs"] = obs
+    return {
+        "observation": obs,
+        "reward": reward,
+        "terminated": terminated,
+        "truncated": truncated,
+        "info": info
+    }
+
+@app.get("/state")
+def api_state():
+    """Evaluator calls this to poll the current environment state."""
+    env = _env_instance.get("env")
+    if not env:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    return {"observation": env.state()}
 
 
 # ── Helper: ensure API key is available before calling inference ──────────────
 def _check_api_key() -> str | None:
-    """Returns None if a key is available, or an error string if not."""
     key = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN")
     if not key:
         return (
@@ -34,18 +103,17 @@ def _check_api_key() -> str | None:
     return None
 
 
-# ── Tab callbacks ─────────────────────────────────────────────────────────────
+# ── 2. Gradio Tab Callbacks ───────────────────────────────────────────────────
 
 def initialize_environment(num_emails, num_meetings, num_tasks, max_steps):
-    env = EnterpriseEnv(
+    req = ResetRequest(
         num_emails_per_day=int(num_emails),
         num_meetings_per_day=int(num_meetings),
         num_tasks_per_day=int(num_tasks),
-        max_steps=int(max_steps),
+        max_steps=int(max_steps)
     )
-    obs, _ = env.reset(seed=42)
-    _env_instance["env"] = env
-    _env_instance["obs"] = obs
+    res = api_reset(req)
+    obs = res["observation"]
     return (
         f"**Environment Initialized**\n"
         f"- Emails: {num_emails}  Meetings: {num_meetings}  Tasks: {num_tasks}\n"
@@ -56,7 +124,6 @@ def initialize_environment(num_emails, num_meetings, num_tasks, max_steps):
         f"- Pending Tasks      : {sum(1 for t in obs.tasks if t.status.value == 'pending')}\n"
     )
 
-
 def triage_email(email_id, category, priority):
     if not _env_instance["env"]:
         return "Error: Initialize the environment first (Setup tab)."
@@ -66,15 +133,13 @@ def triage_email(email_id, category, priority):
         category=EmailCategory(category),
         priority=EmailPriority(priority),
     )
-    obs, reward, terminated, truncated, info = _env_instance["env"].step(action)
-    _env_instance["obs"] = obs
+    res = api_step(StepRequest(action=action))
     return (
         f"Triaged: {email_id}\n"
-        f"Reward : {reward:.3f}\n"
-        f"Done   : {terminated or truncated}\n"
-        f"Cumulative reward: {info['cumulative_reward']:.3f}"
+        f"Reward : {res['reward']:.3f}\n"
+        f"Done   : {res['terminated'] or res['truncated']}\n"
+        f"Cumulative reward: {res['info']['cumulative_reward']:.3f}"
     )
-
 
 def schedule_meeting(meeting_id, hours_offset):
     if not _env_instance["env"]:
@@ -86,15 +151,13 @@ def schedule_meeting(meeting_id, hours_offset):
         meeting_id=meeting_id.strip(),
         scheduled_time=time_slot,
     )
-    obs, reward, terminated, truncated, info = _env_instance["env"].step(action)
-    _env_instance["obs"] = obs
+    res = api_step(StepRequest(action=action))
     return (
         f"Scheduled: {meeting_id}\n"
         f"Time Slot: {time_slot.strftime('%Y-%m-%d %H:%M')}\n"
-        f"Reward   : {reward:.3f}\n"
-        f"Done     : {terminated or truncated}"
+        f"Reward   : {res['reward']:.3f}\n"
+        f"Done     : {res['terminated'] or res['truncated']}"
     )
-
 
 def get_current_state():
     obs = _env_instance.get("obs")
@@ -118,7 +181,6 @@ def get_current_state():
         f"**Time until end of day:** {obs.time_until_end} min\n"
     )
 
-
 def evaluate_performance(difficulty):
     env = _env_instance.get("env")
     obs = _env_instance.get("obs")
@@ -139,16 +201,10 @@ def evaluate_performance(difficulty):
         f"  Meeting Conflicts   : {result['final_metrics']['meeting_conflicts']}\n"
     )
 
-
 def run_baseline_inference(task, steps, seed):
-    """
-    Run the LLM inference agent and return a formatted result.
-    Credentials resolved from OPENAI_API_KEY (preferred) or HF_TOKEN (fallback).
-    """
     err = _check_api_key()
     if err:
         return err
-
     try:
         result = run_llm_agent(
             task_difficulty=task,
@@ -177,19 +233,18 @@ def run_baseline_inference(task, steps, seed):
         return f"Error running inference: {e}"
 
 
-# ── Gradio layout ─────────────────────────────────────────────────────────────
+# ── 3. Gradio layout ──────────────────────────────────────────────────────────
 
 def create_demo_interface():
     with gr.Blocks(title="Enterprise Task Automation — OpenEnv") as demo:
         gr.Markdown("# Enterprise Task Automation Environment")
         gr.Markdown(
             "OpenEnv-compatible RL environment for email triage, meeting scheduling, "
-            "and task prioritization.  "
-            "[OpenEnv Hackathon Submission]"
+            "and task prioritization.  \n\n"
+            "**Note:** REST API endpoints (`/reset`, `/step`, `/state`) are active in the background for automated evaluation!"
         )
 
         with gr.Tabs():
-
             # ── Setup ─────────────────────────────────────────────────────────
             with gr.TabItem("Setup"):
                 num_emails   = gr.Slider(3,  20,  value=10, step=1,  label="Emails per day")
@@ -248,8 +303,7 @@ def create_demo_interface():
             with gr.TabItem("Baseline AI"):
                 gr.Markdown(
                     "### Run LLM Agent (OpenAI)\n"
-                    "Requires `OPENAI_API_KEY` set in HF Space Secrets "
-                    "(Settings → Variables and Secrets)."
+                    "Requires `OPENAI_API_KEY` set in HF Space Secrets."
                 )
                 with gr.Row():
                     bl_task  = gr.Radio(["easy","medium","hard"],
@@ -262,7 +316,7 @@ def create_demo_interface():
                               inputs=[bl_task, bl_steps, bl_seed],
                               outputs=run_output)
 
-            # Documentation Tab
+            # ── Documentation ─────────────────────────────────────────────────
             with gr.TabItem("Documentation"):
                 gr.Markdown("""
 # Enterprise Task Automation Environment: Official Documentation
@@ -287,7 +341,6 @@ The environment is fully containerized and configured for seamless deployment on
 1. Create a new Space on Hugging Face and select the **Docker** SDK as your runtime environment.
 2. Upload the entire project repository to the newly created Space.
 3. The system will automatically utilize the provided `Dockerfile` to build the application and expose port 7860 for the interactive Gradio web interface.
-
 
 ## Usage Guidelines for Evaluators
 Once deployed, evaluators can interact with the environment either programmatically or through the intuitive Gradio web interface.
@@ -314,12 +367,15 @@ Evaluators can also assess the environment programmatically using the provided c
         
         return demo
 
+# Mount Gradio over the FastAPI App
+demo = create_demo_interface()
+app = gr.mount_gradio_app(app, demo, path="/")
+
+# Create the main() function required by [project.scripts]
+def main():
+    """Entry point for the server script"""
+    import uvicorn
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860)
 
 if __name__ == "__main__":
-    demo = create_demo_interface()
-    demo.launch(
-        server_name="0.0.0.0",   # required for HF Spaces
-        server_port=7860,
-        share=False,
-        show_error=True,
-    )
+    main()
