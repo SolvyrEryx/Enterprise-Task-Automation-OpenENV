@@ -351,7 +351,7 @@ def obs_to_prompt(obs, task_difficulty: str, metadata: Optional[Dict] = None) ->
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_llm_response(response_text: str, obs) -> Action:
-    """Parse LLM JSON → Action.  Smart heuristic fallback on any failure."""
+    """Parse LLM JSON → Action. Smart heuristic fallback on any failure."""
     try:
         text = response_text.strip()
         # Strip markdown fences
@@ -384,59 +384,93 @@ def parse_llm_response(response_text: str, obs) -> Action:
                 pri = EmailPriority(data.get("priority", "medium"))
             except ValueError:
                 pri = EmailPriority.MEDIUM
+                
+            # FIX: Use .get() and validate to prevent KeyError
+            email_id = data.get("email_id")
+            if not email_id:
+                raise ValueError("LLM forgot to provide email_id")
+
             return Action(action_type=ActionType.TRIAGE_EMAIL,
-                          email_id=data["email_id"], category=cat, priority=pri)
+                          email_id=email_id, category=cat, priority=pri)
 
         elif action_str == "schedule_meeting":
+            meeting_id = data.get("meeting_id")
+            if not meeting_id:
+                raise ValueError("LLM forgot to provide meeting_id")
+
             raw = data.get("scheduled_time", "")
             if raw.count(":") == 1:
                 raw += ":00"
+                
+            # FIX: Catch ValueError if LLM hallucinates a non-ISO date string
+            try:
+                sched_time = datetime.fromisoformat(raw)
+            except Exception:
+                raise ValueError("LLM provided a malformed datetime string")
+
             return Action(action_type=ActionType.SCHEDULE_MEETING,
-                          meeting_id=data["meeting_id"],
-                          scheduled_time=datetime.fromisoformat(raw))
+                          meeting_id=meeting_id,
+                          scheduled_time=sched_time)
 
         elif action_str == "reprioritize_task":
+            task_id = data.get("task_id")
+            if not task_id:
+                raise ValueError("LLM forgot to provide task_id")
+
             try:
                 new_pri = TaskPriority(data.get("new_priority", "high"))
             except ValueError:
                 new_pri = TaskPriority.HIGH
+
             return Action(action_type=ActionType.REPRIORITIZE_TASK,
-                          task_id=data["task_id"], new_priority=new_pri)
+                          task_id=task_id, new_priority=new_pri)
 
         elif action_str == "complete_task":
-            return Action(action_type=ActionType.COMPLETE_TASK, task_id=data["task_id"])
+            task_id = data.get("task_id")
+            if not task_id:
+                raise ValueError("LLM forgot to provide task_id")
+                
+            return Action(action_type=ActionType.COMPLETE_TASK, task_id=task_id)
 
         else:
             return Action(action_type=ActionType.NOOP)
 
     except Exception:
+        # Catch EVERYTHING from the JSON parsing phase (KeyError, ValueError, TypeError)
         pass
 
     # ── Heuristic fallback ────────────────────────────────────────────────────
-    ready = get_ready_tasks(obs)
-    if ready:
-        return Action(action_type=ActionType.COMPLETE_TASK, task_id=ready[0].task_id)
+    # FIX: Wrap the entire heuristic block in an ultimate safety net.
+    # If the fallback fails for any bizarre reason, it will quietly default to NOOP.
+    try:
+        ready = get_ready_tasks(obs)
+        if ready:
+            return Action(action_type=ActionType.COMPLETE_TASK, task_id=ready[0].task_id)
 
-    pending_meetings = [m for m in obs.meetings if m.status == "pending"]
-    if pending_meetings:
-        slots = get_conflict_free_slots(obs, n=5)
-        if slots:
-            return Action(action_type=ActionType.SCHEDULE_MEETING,
-                          meeting_id=pending_meetings[0].meeting_id,
-                          scheduled_time=datetime.fromisoformat(slots[0]))
+        pending_meetings = [m for m in obs.meetings if m.status == "pending"]
+        if pending_meetings:
+            slots = get_conflict_free_slots(obs, n=5)
+            if slots:
+                return Action(action_type=ActionType.SCHEDULE_MEETING,
+                              meeting_id=pending_meetings[0].meeting_id,
+                              scheduled_time=datetime.fromisoformat(slots[0]))
 
-    unprocessed = sorted([e for e in obs.emails if not e.processed], key=lambda e: -e.urgency)
-    if unprocessed:
-        e = unprocessed[0]
-        pri = (EmailPriority.CRITICAL if e.urgency >= 9 else
-               EmailPriority.HIGH     if e.urgency >= 7 else
-               EmailPriority.MEDIUM   if e.urgency >= 5 else EmailPriority.LOW)
-        cat = (EmailCategory.URGENT        if e.urgency >= 7 else
-               EmailCategory.ACTIONABLE    if e.urgency >= 4 else
-               EmailCategory.INFORMATIONAL)
-        return Action(action_type=ActionType.TRIAGE_EMAIL,
-                      email_id=e.email_id, category=cat, priority=pri)
+        unprocessed = sorted([e for e in obs.emails if not e.processed], key=lambda e: -e.urgency)
+        if unprocessed:
+            e = unprocessed[0]
+            pri = (EmailPriority.CRITICAL if e.urgency >= 9 else
+                   EmailPriority.HIGH     if e.urgency >= 7 else
+                   EmailPriority.MEDIUM   if e.urgency >= 5 else EmailPriority.LOW)
+            cat = (EmailCategory.URGENT        if e.urgency >= 7 else
+                   EmailCategory.ACTIONABLE    if e.urgency >= 4 else
+                   EmailCategory.INFORMATIONAL)
+            return Action(action_type=ActionType.TRIAGE_EMAIL,
+                          email_id=e.email_id, category=cat, priority=pri)
+                          
+    except Exception:
+        pass
 
+    # The ultimate guarantee: if everything fails, do nothing.
     return Action(action_type=ActionType.NOOP)
 
 
