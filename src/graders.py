@@ -19,13 +19,6 @@ class TaskGrader:
 class EasyTask(TaskGrader):
     """
     Easy Task: Email Triage Efficiency
-
-    Goal: Process at least 80% of emails and correctly assign HIGH or CRITICAL
-          priority to every email with urgency >= 7.
-
-    Scoring:
-        0.5 × triage_rate_score   (scaled so 80% = full 0.5)
-        0.5 × urgency_accuracy    (fraction of urgent emails correctly prioritized)
     """
 
     def __init__(self):
@@ -59,26 +52,20 @@ class EasyTask(TaskGrader):
             urgency_accuracy = 1.0  # No urgent emails — full marks
 
         score = triage_score * 0.5 + urgency_accuracy * 0.5
+        
+        # FIX: Clamp score to be strictly between 0 and 1
+        final_score = round(max(0.0001, min(score, 0.9999)), 4)
+        
         explanation = (
             f"Triage rate: {triage_rate:.1%} → score {triage_score*0.5:.3f}/0.5 | "
             f"Urgent accuracy: {urgency_accuracy:.1%} → score {urgency_accuracy*0.5:.3f}/0.5"
         )
-        return round(min(score, 1.0), 4), explanation
+        return final_score, explanation
 
 
 class MediumTask(TaskGrader):
     """
     Medium Task: Meeting Scheduling & Task Prioritization
-
-    Goal:
-      - Schedule >= 70% of pending meetings without conflicts
-      - Reprioritize >= 60% of high-impact tasks (impact >= 0.7 or urgency >= 7)
-        to HIGH or CRITICAL
-
-    Scoring:
-        0.4 × scheduling_score    (70% meetings scheduled = 1.0)
-        0.3 × conflict_score      (−0.1 per conflict, floored at 0)
-        0.3 × prioritization_score
     """
 
     def __init__(self):
@@ -131,26 +118,16 @@ class MediumTask(TaskGrader):
         )
 
         score = scheduling_score * 0.4 + conflict_score * 0.3 + prioritization_score * 0.3
-        return round(min(score, 1.0), 4), " | ".join(details)
+        
+        # FIX: Clamp score to be strictly between 0 and 1
+        final_score = round(max(0.0001, min(score, 0.9999)), 4)
+        
+        return final_score, " | ".join(details)
 
 
 class HardTask(TaskGrader):
     """
     Hard Task: Comprehensive Workflow Optimization Under Pressure
-
-    What makes this genuinely hard:
-      - Requires excellence across ALL four dimensions simultaneously
-      - Penalizes overdue tasks heavily (deadline pressure is real)
-      - Escalations cost double compared to easy/medium
-      - Blocked tasks (missed deadlines) directly penalize the task score
-      - System health score considers both escalations AND missed deadlines
-      - Meeting conflicts penalise at 15% each instead of 10%
-
-    Scoring:
-        0.25 × email_score        (triage rate, must reach 90% for full marks)
-        0.25 × meeting_score      (scheduling rate + conflict avoidance at 15%/conflict)
-        0.25 × task_score         (completion rate + overdue penalty combined)
-        0.25 × health_score       (escalation penalty 20% each + deadline miss 15% each)
     """
 
     def __init__(self):
@@ -158,21 +135,19 @@ class HardTask(TaskGrader):
             name="Comprehensive Workflow Optimization Under Pressure",
             description=(
                 "Simultaneously maximize email triage (90% target), meeting scheduling "
-                "without conflicts, task completion before deadlines, and system health "
-                "(minimal escalations and missed deadlines). All four dimensions must "
-                "excel — weakness in any one pulls the total score below 0.75."
+                "without conflicts, task completion before deadlines, and system health."
             ),
         )
 
     def grade(self, observation: Observation, metadata: Dict) -> Tuple[float, str]:
         details = []
 
-        # 1. Email score — harder target (90%)
+        # 1. Email score
         email_triage_rate = observation.email_triage_rate
         email_score = min(email_triage_rate / 0.90, 1.0)
         details.append(f"Email (90% target): {email_triage_rate:.1%} → {email_score*0.25:.3f}/0.25")
 
-        # 2. Meeting score — conflict penalty at 15%/conflict (stricter than medium)
+        # 2. Meeting score
         total_meetings = len(observation.meetings)
         if total_meetings > 0:
             scheduled_rate = observation.meeting_schedule_success_rate
@@ -182,19 +157,18 @@ class HardTask(TaskGrader):
             meeting_score = 1.0
         details.append(f"Meetings: {meeting_score:.1%} → {meeting_score*0.25:.3f}/0.25")
 
-        # 3. Task score — completion rate + heavy overdue penalty
+        # 3. Task score
         completion_rate = observation.task_completion_rate
         total_tasks = len(observation.tasks)
         if total_tasks > 0:
-            # Each overdue task penalises by 15% of the overdue fraction
             overdue_fraction = observation.overdue_tasks_count / total_tasks
-            overdue_penalty = max(0.0, 1.0 - overdue_fraction * 2.0)  # >50% overdue → 0
+            overdue_penalty = max(0.0, 1.0 - overdue_fraction * 2.0)
             task_score = (completion_rate + overdue_penalty) / 2.0
         else:
             task_score = 1.0
         details.append(f"Tasks: completion={completion_rate:.1%} overdue={observation.overdue_tasks_count} → {task_score*0.25:.3f}/0.25")
 
-        # 4. System health — escalations (-20% each) + deadline misses (-15% each)
+        # 4. System health
         escalations = metadata.get("escalations", 0)
         deadline_misses = metadata.get("deadline_misses", 0)
         escalation_penalty = max(0.0, 1.0 - escalations * 0.20)
@@ -205,7 +179,11 @@ class HardTask(TaskGrader):
         )
 
         score = email_score * 0.25 + meeting_score * 0.25 + task_score * 0.25 + health_score * 0.25
-        return round(min(score, 1.0), 4), " | ".join(details)
+        
+        # FIX: Clamp score to be strictly between 0 and 1
+        final_score = round(max(0.0001, min(score, 0.9999)), 4)
+        
+        return final_score, " | ".join(details)
 
 
 # ─── Registry ──────────────────────────────────────────────────────────────────
@@ -226,14 +204,6 @@ def evaluate_agent_performance(
 ) -> Dict:
     """
     Evaluate agent performance on a completed episode.
-
-    Args:
-        env: The environment instance (for metadata).
-        final_observation: Observation at end of episode.
-        task_difficulty: "easy", "medium", or "hard".
-
-    Returns:
-        Dict with score, explanation, metrics.
     """
     graders = get_task_graders()
     if task_difficulty not in graders:
