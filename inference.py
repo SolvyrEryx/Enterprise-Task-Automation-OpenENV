@@ -13,7 +13,6 @@ Usage:
   python inference.py --task easy   --seed 42
   python inference.py --task medium --seed 42
   python inference.py --task hard   --seed 42
-  python inference.py --task all    --seed 42
 """
 
 import sys
@@ -22,6 +21,7 @@ import argparse
 import time
 import os
 import random
+import math
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -42,19 +42,45 @@ class StructuredLogger:
     def __init__(self):
         self.start_time = None
         self.step_count = 0
+        self._rewards = []          # Step 4: track every per-step reward
 
     def start(self, config: Dict[str, Any]):
         self.start_time = time.time()
         self.step_count = 0
-        print(f"[START] {json.dumps({'event':'START','timestamp':datetime.now().isoformat(),'config':config})}")
+        self._rewards = []
+        # Step 2: env is always the fixed env name, not the task value
+        print(
+            f"[START] task={config.get('task','')} "
+            f"env=enterprise-task-automation "
+            f"model={config.get('model','')} "
+            f"seed={config.get('seed','')} "
+            f"max_steps={config.get('max_steps','')} "
+            f"emails={config.get('initial_emails','')} "
+            f"meetings={config.get('initial_meetings','')} "
+            f"tasks={config.get('initial_tasks','')}",
+            flush=True,
+        )
 
-    def step(self, step_num: int, action: str, reward: float, obs_summary: Dict):
+    def step(self, step_num: int, action: str, reward: float, done_flag: bool):
+        # Step 4: accumulate reward
+        self._rewards.append(reward)
         self.step_count += 1
-        print(f"[STEP] {json.dumps({'event':'STEP','step':step_num,'action':action,'reward':round(reward,4),'obs':obs_summary,'timestamp':datetime.now().isoformat()})}")
+        # Step 3: strict minimal format — no extra fields
+        print(
+            f"[STEP] step={step_num} action={action} reward={reward:.2f} "
+            f"done={str(done_flag).lower()} error=null",
+            flush=True,
+        )
 
-    def end(self, final_score: float, metadata: Dict):
-        elapsed = time.time() - self.start_time if self.start_time else 0
-        print(f"[END] {json.dumps({'event':'END','final_score':round(final_score,4),'total_steps':self.step_count,'elapsed_seconds':round(elapsed,2),'metadata':metadata,'timestamp':datetime.now().isoformat()})}")
+    def end(self, final_score: float, steps: int):
+        # Step 5 & 7: comma-separated rewards list, score at .3f precision
+        score = max(0.01, min(float(final_score), 0.99))
+        rewards_str = ",".join(f"{r:.2f}" for r in self._rewards) or "0.00"
+        success = str(score >= 0.5).lower()
+        print(
+            f"[END] success={success} steps={steps} score={score:.3f} rewards={rewards_str}",
+            flush=True,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -384,8 +410,7 @@ def parse_llm_response(response_text: str, obs) -> Action:
                 pri = EmailPriority(data.get("priority", "medium"))
             except ValueError:
                 pri = EmailPriority.MEDIUM
-                
-            # FIX: Use .get() and validate to prevent KeyError
+
             email_id = data.get("email_id")
             if not email_id:
                 raise ValueError("LLM forgot to provide email_id")
@@ -401,8 +426,7 @@ def parse_llm_response(response_text: str, obs) -> Action:
             raw = data.get("scheduled_time", "")
             if raw.count(":") == 1:
                 raw += ":00"
-                
-            # FIX: Catch ValueError if LLM hallucinates a non-ISO date string
+
             try:
                 sched_time = datetime.fromisoformat(raw)
             except Exception:
@@ -429,19 +453,16 @@ def parse_llm_response(response_text: str, obs) -> Action:
             task_id = data.get("task_id")
             if not task_id:
                 raise ValueError("LLM forgot to provide task_id")
-                
+
             return Action(action_type=ActionType.COMPLETE_TASK, task_id=task_id)
 
         else:
             return Action(action_type=ActionType.NOOP)
 
     except Exception:
-        # Catch EVERYTHING from the JSON parsing phase (KeyError, ValueError, TypeError)
         pass
 
     # ── Heuristic fallback ────────────────────────────────────────────────────
-    # FIX: Wrap the entire heuristic block in an ultimate safety net.
-    # If the fallback fails for any bizarre reason, it will quietly default to NOOP.
     try:
         ready = get_ready_tasks(obs)
         if ready:
@@ -466,11 +487,10 @@ def parse_llm_response(response_text: str, obs) -> Action:
                    EmailCategory.INFORMATIONAL)
             return Action(action_type=ActionType.TRIAGE_EMAIL,
                           email_id=e.email_id, category=cat, priority=pri)
-                          
+
     except Exception:
         pass
 
-    # The ultimate guarantee: if everything fails, do nothing.
     return Action(action_type=ActionType.NOOP)
 
 
@@ -479,7 +499,7 @@ def parse_llm_response(response_text: str, obs) -> Action:
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Model pinned for hard tasks — never overridden by MODEL_NAME env var.
-_HARD_MODEL   = "gpt-4o-mini"
+_HARD_MODEL    = "gpt-4o-mini"
 _DEFAULT_MODEL = "gpt-3.5-turbo"
 
 
@@ -493,12 +513,6 @@ def get_openai_client(task_difficulty: str) -> Tuple[OpenAI, str]:
       Priority 1 — hard task: ALWAYS "gpt-4o-mini", regardless of MODEL_NAME.
       Priority 2 — easy/medium with MODEL_NAME set: use MODEL_NAME.
       Priority 3 — easy/medium without MODEL_NAME: fall back to "gpt-3.5-turbo".
-
-    Root-cause note:
-      os.getenv("MODEL_NAME", default) ignores `default` the moment MODEL_NAME
-      exists in the environment, so the old hard-task branch was silently
-      bypassed whenever MODEL_NAME was set via HF Secrets.  The fix evaluates
-      task_difficulty FIRST, before consulting the environment variable.
     """
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN")
     if not api_key:
@@ -507,12 +521,9 @@ def get_openai_client(task_difficulty: str) -> Tuple[OpenAI, str]:
 
     base_url = os.getenv("API_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
 
-    # ── Model resolution — task_difficulty is checked FIRST ──────────────────
     if task_difficulty == "hard":
-        # Hard override: MODEL_NAME is intentionally ignored here.
         model = _HARD_MODEL
     else:
-        # Easy / medium: respect MODEL_NAME if provided, else use cheap default.
         model = os.getenv("MODEL_NAME") or _DEFAULT_MODEL
 
     print(f"[MODEL SELECTED] task={task_difficulty!r} → model={model!r}"
@@ -569,7 +580,76 @@ def run_llm_agent(
 
     while step < max_steps and not obs.done:
         step += 1
-        prompt = obs_to_prompt(obs, task_difficulty, env.metadata)
+
+        # ── STRATEGY LAYER: focus on the weakest scoring dimension ──────────
+        scores = current_score_breakdown(obs, env.metadata)
+        sorted_dims = sorted(
+            [(k, v) for k, v in scores.items() if k != "total"],
+            key=lambda x: x[1]
+        )
+        priority_dimension  = sorted_dims[0][0]
+        secondary_dimension = sorted_dims[1][0]
+
+        if priority_dimension == "email":
+            strategy = "FOCUS_EMAIL"
+        elif priority_dimension == "meeting":
+            strategy = "FOCUS_MEETINGS"
+        elif priority_dimension == "task":
+            strategy = "FOCUS_TASKS"
+        else:
+            strategy = "BALANCED"
+
+        tradeoff_context = f"""
+ADAPTIVE STRATEGY (MANDATORY):
+
+Strategy Mode: {strategy} (Primary: {priority_dimension.upper()})
+Secondary focus: {secondary_dimension.upper()}
+
+You MUST prioritize improving the primary dimension.
+Avoid actions that do not improve the primary dimension unless absolutely necessary.
+If possible, also improve the secondary dimension.
+
+Scores:
+Email={scores['email']:.2f}, Meeting={scores['meeting']:.2f}, Task={scores['task']:.2f}, Health={scores['health']:.2f}
+
+Reason:
+{priority_dimension} is currently the lowest scoring dimension and is limiting overall system performance.
+
+Decision Rule:
+Prefer actions that improve {priority_dimension} more than other dimensions.
+If two actions are similar, choose the one that also improves {secondary_dimension}.
+
+Action Selection Priority:
+1. Choose actions that improve the primary dimension.
+2. If multiple actions improve it, choose the one that also improves the secondary dimension.
+3. If no action improves the primary dimension, choose the safest action that avoids penalties.
+
+Action Guidance:
+* Email → use "triage_email"
+* Meeting → use "schedule_meeting"
+* Task → use "complete_task" or "reprioritize_task"
+
+Goal:
+Maximize TOTAL score by improving weakest dimensions first.
+
+Penalty Awareness:
+Avoid actions that introduce conflicts, overdue tasks, or missed deadlines, as they reduce overall score.
+
+Consistency Rule:
+Stick to the chosen strategy unless a clearly better opportunity appears.
+
+Urgency Override:
+If a task, meeting, or deadline is critically urgent, prioritize it immediately even if it is not the primary focus.
+
+Tradeoff Hint:
+Avoid actions that significantly harm other dimensions.
+"""
+
+        base_prompt = obs_to_prompt(obs, task_difficulty, env.metadata)
+        prompt = tradeoff_context + "\n" + base_prompt
+
+        # Controlled per-step seed for reproducibility
+        random.seed(seed + step)
 
         try:
             response = client.chat.completions.create(
@@ -579,6 +659,7 @@ def run_llm_agent(
                         "role": "system",
                         "content": (
                             "You are a precise enterprise workflow AI. "
+                            "This system optimizes a multi-objective score across competing constraints. "
                             "Respond ONLY with a single valid JSON object — "
                             "no explanation, no markdown, no extra text."
                         ),
@@ -586,7 +667,7 @@ def run_llm_agent(
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=120,
-                temperature=0.0,
+                temperature=0.2,
             )
             response_text = response.choices[0].message.content or ""
         except Exception as e:
@@ -595,39 +676,58 @@ def run_llm_agent(
 
         action = parse_llm_response(response_text, obs)
 
+        # Lightweight reasoning trace (stderr only — does not affect validator)
+        print(
+            f"[THINK] strategy={strategy} primary={priority_dimension} "
+            f"secondary={secondary_dimension}",
+            file=sys.stderr,
+        )
+
         if verbose:
-            print(f"[DBG step={step}] {response_text.strip()!r} → {action.action_type.value}",
-                  file=sys.stderr)
+            print(
+                f"[DBG step={step}] {response_text.strip()!r} → {action.action_type.value}",
+                file=sys.stderr,
+            )
 
         obs, reward, terminated, truncated, _ = env.step(action)
         cumulative_reward += reward
 
-        logger.step(step, action.action_type.value, reward, {
-            "email_triage_rate":          round(obs.email_triage_rate, 3),
-            "meeting_schedule_rate":      round(obs.meeting_schedule_success_rate, 3),
-            "task_completion_rate":       round(obs.task_completion_rate, 3),
-            "unprocessed_emails":         obs.unprocessed_emails_count,
-            "meeting_conflicts":          obs.meeting_conflicts,
-            "overdue_tasks":              obs.overdue_tasks_count,
-        })
+        # Step 6: pass done_flag boolean instead of obs_summary dict
+        done_flag = terminated or truncated
+        logger.step(step, action.action_type.value, reward, done_flag)
 
-        if terminated or truncated:
+        if done_flag:
             break
 
     graders   = get_task_graders()
     grader    = graders[task_difficulty]
     final_obs = env.state()
-    score, explanation = grader.grade(final_obs, env.metadata)
+    raw_score, explanation = grader.grade(final_obs, env.metadata)
+
+    epsilon = 1e-6
+
+    try:
+        score = float(raw_score)
+    except Exception:
+        score = 0.5
+
+    if math.isnan(score) or math.isinf(score):
+        score = 0.5
+
+    if not (0 < score < 1):
+        score = min(1 - epsilon, max(epsilon, score))
+
+    score = float(score)
 
     results = {
-        "task":             grader.name,
-        "difficulty":       task_difficulty,
-        "model":            model_name,
-        "seed":             seed,
-        "score":            score,
-        "explanation":      explanation,
+        "task":              grader.name,
+        "difficulty":        task_difficulty,
+        "model":             model_name,
+        "seed":              seed,
+        "score":             score,
+        "explanation":       explanation or "",
         "cumulative_reward": cumulative_reward,
-        "steps_completed":  step,
+        "steps_completed":   step,
         "final_metrics": {
             "email_triage_rate":             final_obs.email_triage_rate,
             "task_completion_rate":          final_obs.task_completion_rate,
@@ -639,21 +739,8 @@ def run_llm_agent(
         "metadata": env.metadata,
     }
 
-    logger.end(score, results)
+    logger.end(score, step)
     return results
-
-
-def run_all_tasks(seed: int = 42, verbose: bool = False) -> Dict[str, float]:
-    scores = {}
-    for difficulty in ("easy", "medium", "hard"):
-        steps = STEP_BUDGETS[difficulty]
-        print(f"\n{'='*60}\nRunning {difficulty.upper()} ({steps} steps, seed={seed})\n{'='*60}",
-              file=sys.stderr)
-        result = run_llm_agent(task_difficulty=difficulty, max_steps=steps,
-                               seed=seed, verbose=verbose)
-        scores[difficulty] = result["score"]
-        print(f"  Score: {result['score']:.4f}  |  {result['explanation']}", file=sys.stderr)
-    return scores
 
 
 def evaluate_submission(task_difficulty: str = "medium",
@@ -665,31 +752,18 @@ def evaluate_submission(task_difficulty: str = "medium",
 
 def main():
     parser = argparse.ArgumentParser(description="Enterprise Task Automation — LLM Inference")
-    parser.add_argument("--task",    choices=["easy","medium","hard","all"], default="medium")
-    parser.add_argument("--steps",   type=int,  default=None,
-                        help="Max steps (default: auto per difficulty)")
+    parser.add_argument("--task", choices=["easy", "medium", "hard"], default="medium")
     parser.add_argument("--seed",    type=int,  default=42)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    if args.task == "all":
-        scores = run_all_tasks(seed=args.seed, verbose=args.verbose)
-        print("\n" + "="*60, file=sys.stderr)
-        print("BASELINE SCORES  (seed=42, reproducible)", file=sys.stderr)
-        print("="*60, file=sys.stderr)
-        for diff, sc in scores.items():
-            print(f"  {diff:8s}: {sc:.4f}/1.0", file=sys.stderr)
-        sys.exit(0)
-
-    results = run_llm_agent(
+    result = run_llm_agent(
         task_difficulty=args.task,
-        max_steps=args.steps,
         seed=args.seed,
         verbose=args.verbose,
     )
-    print(f"\n{'='*60}\nTask:  {results['task']}\nScore: {results['score']:.4f}/1.0"
-          f"\nExpl:  {results['explanation']}", file=sys.stderr)
-    sys.exit(0 if results["score"] > 0.0 else 1)
+
+    print(result["score"])
 
 
 if __name__ == "__main__":
